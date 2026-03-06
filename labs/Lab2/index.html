@@ -1,0 +1,530 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Lab2 - VR application (A-Frame 1.7.1 + custom PLY pointcloud)</title>
+  <meta name="description" content="Custom PLY pointcloud loader + floating VR buttons" />
+
+  <!-- Newest A-Frame (1.7.1) -->
+  <script src="https://aframe.io/releases/1.7.1/aframe.min.js"></script>
+
+  <script>
+    /**
+     * Minimal PLY loader for point clouds (ASCII + binary_little_endian).
+     * - Supports vertex properties: x y z, optional red green blue (uchar) and alpha.
+     * - Creates THREE.Points with PointsMaterial.
+     * - Optional sprite texture for each point.
+     */
+    (function () {
+      function decodeText(arrayBuffer) {
+        return new TextDecoder("utf-8").decode(arrayBuffer);
+      }
+
+      function parseHeader(text) {
+        const lines = text.split(/\r?\n/);
+        if (lines[0].trim() !== "ply") throw new Error("Not a PLY file (missing 'ply' header).");
+
+        let format = null;
+        let vertexCount = 0;
+        let inVertexElement = false;
+        const vertexProps = [];
+
+        let headerEndLineIndex = -1;
+        for (let i = 0; i < lines.length; i++) {
+          const line = lines[i].trim();
+          if (!line) continue;
+
+          if (line.startsWith("format ")) {
+            // format ascii 1.0 | format binary_little_endian 1.0
+            format = line.split(/\s+/)[1];
+          } else if (line.startsWith("element ")) {
+            const parts = line.split(/\s+/);
+            inVertexElement = parts[1] === "vertex";
+            if (inVertexElement) vertexCount = parseInt(parts[2], 10);
+          } else if (line.startsWith("property ") && inVertexElement) {
+            // property float x
+            const parts = line.split(/\s+/);
+            const type = parts[1];
+            const name = parts[2];
+            // skip list properties (faces) for point cloud use-case
+            if (type === "list") continue;
+            vertexProps.push({ type, name });
+          } else if (line === "end_header") {
+            headerEndLineIndex = i;
+            break;
+          }
+        }
+
+        if (!format) throw new Error("PLY header missing 'format'.");
+        if (!vertexCount) throw new Error("PLY header missing 'element vertex <N>'.");
+        if (headerEndLineIndex < 0) throw new Error("PLY header missing 'end_header'.");
+
+        return { format, vertexCount, vertexProps, headerLineCount: headerEndLineIndex + 1 };
+      }
+
+      function plyTypeToReader(type) {
+        // Return {bytes, read(DataView, offset)}.
+        // Common PLY types: char/uchar, short/ushort, int/uint, float/double.
+        switch (type) {
+          case "char":
+          case "int8":   return { bytes: 1, read: (dv, o) => dv.getInt8(o) };
+          case "uchar":
+          case "uint8":  return { bytes: 1, read: (dv, o) => dv.getUint8(o) };
+          case "short":
+          case "int16":  return { bytes: 2, read: (dv, o) => dv.getInt16(o, true) };
+          case "ushort":
+          case "uint16": return { bytes: 2, read: (dv, o) => dv.getUint16(o, true) };
+          case "int":
+          case "int32":  return { bytes: 4, read: (dv, o) => dv.getInt32(o, true) };
+          case "uint":
+          case "uint32": return { bytes: 4, read: (dv, o) => dv.getUint32(o, true) };
+          case "float":
+          case "float32": return { bytes: 4, read: (dv, o) => dv.getFloat32(o, true) };
+          case "double":
+          case "float64": return { bytes: 8, read: (dv, o) => dv.getFloat64(o, true) };
+          default: throw new Error("Unsupported PLY property type: " + type);
+        }
+      }
+
+      function buildGeometryFromAscii(text, header) {
+        // Data starts right after header lines.
+        const lines = text.split(/\r?\n/).slice(header.headerLineCount);
+        const positions = new Float32Array(header.vertexCount * 3);
+
+        const hasRGB = header.vertexProps.some(p => p.name === "red") &&
+                       header.vertexProps.some(p => p.name === "green") &&
+                       header.vertexProps.some(p => p.name === "blue");
+        const colors = hasRGB ? new Float32Array(header.vertexCount * 3) : null;
+
+        // Property indices.
+        const idx = {};
+        header.vertexProps.forEach((p, i) => { idx[p.name] = i; });
+
+        let v = 0;
+        for (let i = 0; i < lines.length && v < header.vertexCount; i++) {
+          const line = lines[i].trim();
+          if (!line) continue;
+
+          const parts = line.split(/\s+/);
+          const x = parseFloat(parts[idx.x]);
+          const y = parseFloat(parts[idx.y]);
+          const z = parseFloat(parts[idx.z]);
+
+          positions[v * 3 + 0] = x;
+          positions[v * 3 + 1] = y;
+          positions[v * 3 + 2] = z;
+
+          if (colors) {
+            const r = parseFloat(parts[idx.red]) / 255.0;
+            const g = parseFloat(parts[idx.green]) / 255.0;
+            const b = parseFloat(parts[idx.blue]) / 255.0;
+            colors[v * 3 + 0] = r;
+            colors[v * 3 + 1] = g;
+            colors[v * 3 + 2] = b;
+          }
+
+          v++;
+        }
+
+        const geom = new THREE.BufferGeometry();
+        geom.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+        if (colors) geom.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+        geom.computeBoundingSphere();
+        return geom;
+      }
+
+      function buildGeometryFromBinaryLittleEndian(arrayBuffer, header, headerByteLength) {
+        const dv = new DataView(arrayBuffer, headerByteLength);
+        const positions = new Float32Array(header.vertexCount * 3);
+
+        const hasRGB = header.vertexProps.some(p => p.name === "red") &&
+                       header.vertexProps.some(p => p.name === "green") &&
+                       header.vertexProps.some(p => p.name === "blue");
+        const colors = hasRGB ? new Float32Array(header.vertexCount * 3) : null;
+
+        const readers = header.vertexProps.map(p => plyTypeToReader(p.type));
+        const names = header.vertexProps.map(p => p.name);
+        const stride = readers.reduce((sum, r) => sum + r.bytes, 0);
+
+        let offset = 0;
+        for (let v = 0; v < header.vertexCount; v++) {
+          let x=0,y=0,z=0, r=1,g=1,b=1;
+          let local = offset;
+          for (let i = 0; i < readers.length; i++) {
+            const val = readers[i].read(dv, local);
+            const name = names[i];
+            if (name === "x") x = val;
+            else if (name === "y") y = val;
+            else if (name === "z") z = val;
+            else if (colors && name === "red") r = val / 255.0;
+            else if (colors && name === "green") g = val / 255.0;
+            else if (colors && name === "blue") b = val / 255.0;
+            local += readers[i].bytes;
+          }
+
+          positions[v * 3 + 0] = x;
+          positions[v * 3 + 1] = y;
+          positions[v * 3 + 2] = z;
+
+          if (colors) {
+            colors[v * 3 + 0] = r;
+            colors[v * 3 + 1] = g;
+            colors[v * 3 + 2] = b;
+          }
+
+          offset += stride;
+        }
+
+        const geom = new THREE.BufferGeometry();
+        geom.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+        if (colors) geom.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+        geom.computeBoundingSphere();
+        return geom;
+      }
+
+      async function fetchArrayBuffer(url) {
+        const res = await fetch(url);
+        if (!res.ok) throw new Error("Failed to load " + url + " (" + res.status + ")");
+        return await res.arrayBuffer();
+      }
+
+      // Component
+      AFRAME.registerComponent("ply-pointcloud", {
+        schema: {
+          src: { type: "string" },           // e.g. url(sculpt.ply) OR sculpt.ply
+          size: { type: "number", default: 0.01 },
+          opacity: { type: "number", default: 1.0 },
+          texture: { type: "string", default: "" },  // e.g. url(VGTU-logo.png)
+          depthWrite: { type: "boolean", default: true }
+        },
+
+        init: function () {
+          this.points = null;
+          this.material = null;
+          this.geometry = null;
+          this.tex = null;
+        },
+
+        remove: function () {
+          if (this.points) this.el.removeObject3D("mesh");
+          if (this.geometry) this.geometry.dispose();
+          if (this.material) this.material.dispose();
+          if (this.tex) this.tex.dispose();
+          this.points = this.material = this.geometry = this.tex = null;
+        },
+
+        update: function () {
+          this.load();
+        },
+
+        async load() {
+          const data = this.data;
+          if (!data.src) return;
+
+          // Resolve url(...) syntax that A-Frame uses.
+          const src = data.src.replace(/^url\((.*)\)$/i, "$1").replace(/^['"]|['"]$/g, "");
+
+          try {
+            const ab = await fetchArrayBuffer(src);
+
+            // We need header as text; for binary we still parse header from start.
+            // Find "end_header\n" byte index (works for ASCII header for both formats).
+            const headerText = decodeText(ab.slice(0, Math.min(ab.byteLength, 20000)));
+            const header = parseHeader(headerText);
+
+            const endHeaderMatch = headerText.match(/end_header\r?\n/);
+            if (!endHeaderMatch) throw new Error("Could not locate end_header.");
+            const headerByteLength = headerText.indexOf(endHeaderMatch[0]) + endHeaderMatch[0].length;
+
+            let geometry;
+            if (header.format === "ascii") {
+              geometry = buildGeometryFromAscii(decodeText(ab), header);
+            } else if (header.format === "binary_little_endian") {
+              geometry = buildGeometryFromBinaryLittleEndian(ab, header, headerByteLength);
+            } else {
+              throw new Error("Unsupported PLY format: " + header.format);
+            }
+
+            // Dispose previous
+            if (this.geometry) this.geometry.dispose();
+            this.geometry = geometry;
+
+            // Texture (sprite)
+            if (this.tex) { this.tex.dispose(); this.tex = null; }
+            if (data.texture) {
+              const texUrl = data.texture.replace(/^url\((.*)\)$/i, "$1").replace(/^['"]|['"]$/g, "");
+              this.tex = new THREE.TextureLoader().load(texUrl);
+              this.tex.colorSpace = THREE.SRGBColorSpace || this.tex.colorSpace;
+            }
+
+            // Material
+            if (this.material) this.material.dispose();
+            const hasColors = !!geometry.getAttribute("color");
+            this.material = new THREE.PointsMaterial({
+              size: data.size,
+              opacity: data.opacity,
+              transparent: data.opacity < 1 || !!this.tex,
+              depthWrite: data.depthWrite,
+              vertexColors: hasColors,
+              map: this.tex || null,
+              alphaTest: this.tex ? 0.2 : 0.0
+            });
+
+            // Points
+            if (this.points) this.el.removeObject3D("mesh");
+            this.points = new THREE.Points(geometry, this.material);
+            this.el.setObject3D("mesh", this.points);
+
+          } catch (e) {
+            console.error("[ply-pointcloud] load error:", e);
+          }
+        }
+      });
+
+      // Primitive <a-pointcloud> for convenience (matches your original HTML).
+      AFRAME.registerPrimitive("a-pointcloud", {
+        defaultComponents: { "ply-pointcloud": {} },
+        mappings: {
+          src: "ply-pointcloud.src",
+          size: "ply-pointcloud.size",
+          opacity: "ply-pointcloud.opacity",
+          texture: "ply-pointcloud.texture",
+          depthWrite: "ply-pointcloud.depthWrite"
+        }
+      });
+    })();
+  </script>
+
+  <script>
+    // --- App UI logic ---
+    const APP = {
+      models: [
+        {
+          name: "Sculpt",
+          src: "url(sculpt.ply)",
+          size: 0.01,
+          position: { x: 0, y: 0.08, z: -2.5 },
+          rotation: { x: -90, y: 45, z: 0 },
+          scale: 0.10,
+          texture: "",
+          depthWrite: true
+        },
+        {
+          name: "Sphere",
+          src: "url(Sphere.ply)",
+          size: 0.05,
+          position: { x: 0, y: 1.25, z: -2.5 },
+          rotation: { x: 0, y: 0, z: 0 },
+          scale: 0.50,
+          texture: "url(VGTU-logo.png)",
+          depthWrite: false
+        }
+      ],
+      i: 0,
+      moveStep: 0.25,
+      rotateStepDeg: 15,
+      zoomStep: 1.15,
+
+      cloud() { return document.querySelector("#cloud"); },
+      label() { return document.querySelector("#modelLabel"); },
+
+      apply(i) {
+        this.i = i;
+        const m = this.models[i];
+        const el = this.cloud();
+
+        el.setAttribute("src", m.src);
+        el.setAttribute("size", m.size);
+        el.setAttribute("texture", m.texture);
+        el.setAttribute("depthWrite", m.depthWrite);
+
+        el.setAttribute("position", `${m.position.x} ${m.position.y} ${m.position.z}`);
+        el.setAttribute("rotation", `${m.rotation.x} ${m.rotation.y} ${m.rotation.z}`);
+        el.setAttribute("scale", `${m.scale} ${m.scale} ${m.scale}`);
+
+        const label = this.label();
+        if (label) label.setAttribute("value", `Model: ${m.name}`);
+      },
+
+      rotateY(d) {
+        const el = this.cloud();
+        const r = el.getAttribute("rotation");
+        el.setAttribute("rotation", `${r.x} ${r.y + d} ${r.z}`);
+      },
+
+      move(dx, dy) {
+        const el = this.cloud();
+        const p = el.getAttribute("position");
+        el.setAttribute("position", `${p.x + dx} ${p.y + dy} ${p.z}`);
+      },
+
+      zoom(mult) {
+        const el = this.cloud();
+        const s = el.getAttribute("scale");
+        const nx = Math.max(0.01, s.x * mult);
+        el.setAttribute("scale", `${nx} ${nx} ${nx}`);
+      },
+
+      reset() { this.apply(this.i); },
+
+      toggle() { this.apply((this.i + 1) % this.models.length); }
+    };
+
+    AFRAME.registerComponent("ui-action", {
+      schema: { action: { type: "string" } },
+      init: function () {
+        this.el.addEventListener("click", () => {
+          switch (this.data.action) {
+            case "rotL": APP.rotateY(-APP.rotateStepDeg); break;
+            case "rotR": APP.rotateY( APP.rotateStepDeg); break;
+            case "mvL":  APP.move(-APP.moveStep, 0); break;
+            case "mvR":  APP.move( APP.moveStep, 0); break;
+            case "mvU":  APP.move(0,  APP.moveStep); break;
+            case "mvD":  APP.move(0, -APP.moveStep); break;
+            case "zoomIn":  APP.zoom(APP.zoomStep); break;
+            case "zoomOut": APP.zoom(1 / APP.zoomStep); break;
+            case "reset": APP.reset(); break;
+            case "switch": APP.toggle(); break;
+          }
+        });
+      }
+    });
+
+    AFRAME.registerComponent("app-init", {
+      init: function () {
+        APP.apply(0);
+      }
+    });
+  </script>
+</head>
+
+<body>
+  <a-scene app-init renderer="colorManagement: true">
+    <a-assets>
+      <img id="groundTexture" src="https://cdn.aframe.io/a-painter/images/floor.jpg" />
+      <img id="skyTexture" src="https://cdn.aframe.io/a-painter/images/sky.jpg" />
+      <img id="vgtuLogo" src="VGTU-logo.png" />
+    </a-assets>
+
+    <!-- Matching background -->
+    <a-sky src="#skyTexture"></a-sky>
+    <a-plane src="#groundTexture" rotation="-90 0 0" width="60" height="60"></a-plane>
+    <a-light type="ambient" intensity="0.7"></a-light>
+    <a-light type="directional" intensity="1.0" position="2 4 2"></a-light>
+
+    <!-- Logo wall -->
+    <a-plane src="#vgtuLogo"
+             position="0 2.0 -6"
+             width="3" height="1.5"
+             material="transparent: true; opacity: 0.95; side: double">
+    </a-plane>
+
+    <!-- ONLY ONE model entity -->
+    <a-pointcloud id="cloud" src="url(sculpt.ply)" size="0.01"></a-pointcloud>
+
+    <!-- Camera rig + interaction -->
+    <a-entity id="rig" position="0 0 0">
+      <a-camera position="0 1.6 0">
+        <!-- Desktop mouse -->
+        <a-entity
+          cursor="rayOrigin: mouse; fuse: false"
+          raycaster="objects: .clickable; far: 10"
+          position="0 0 -1"
+          geometry="primitive: ring; radiusInner: 0.01; radiusOuter: 0.015"
+          material="color: white; shader: flat">
+        </a-entity>
+      </a-camera>
+
+      <!-- VR controllers -->
+      <a-entity laser-controls="hand: left" raycaster="objects: .clickable; far: 10"></a-entity>
+      <a-entity laser-controls="hand: right" raycaster="objects: .clickable; far: 10"></a-entity>
+    </a-entity>
+
+    <!-- FLOATING PANEL in world space (not attached to camera) -->
+    <!-- Moved to the right side and made smaller so it doesn't cover the model -->
+    <a-entity id="uiPanel" position="1.05 1.35 -1.25" rotation="0 -20 0">
+      <a-plane width="1.25" height="0.95"
+               material="color: #22252a; opacity: 0.92; side: double"></a-plane>
+
+      <a-text id="modelLabel"
+              value="Model: Sculpt"
+              align="center"
+              position="0 0.40 0.01"
+              width="1.25"
+              color="#ffffff">
+      </a-text>
+
+      <!-- Rotate -->
+      <a-entity position="0 0.22 0.01">
+        <a-plane class="clickable" ui-action="action: rotL"
+                 position="-0.33 0 0" width="0.46" height="0.18"
+                 material="color: #3a3f48; opacity: 0.98; side: double">
+          <a-text value="Rotate left" align="center" position="0 -0.01 0.01" width="0.8" color="#fff"></a-text>
+        </a-plane>
+        <a-plane class="clickable" ui-action="action: rotR"
+                 position="0.33 0 0" width="0.46" height="0.18"
+                 material="color: #3a3f48; opacity: 0.98; side: double">
+          <a-text value="Rotate right" align="center" position="0 -0.01 0.01" width="0.8" color="#fff"></a-text>
+        </a-plane>
+      </a-entity>
+
+      <!-- Move -->
+      <a-entity position="0 0.02 0.01">
+        <a-plane class="clickable" ui-action="action: mvL"
+                 position="-0.42 0 0" width="0.30" height="0.18"
+                 material="color: #3a3f48; opacity: 0.98; side: double">
+          <a-text value="<" align="center" position="0 -0.01 0.01" width="0.8" color="#fff"></a-text>
+        </a-plane>
+
+        <a-plane class="clickable" ui-action="action: mvU"
+                 position="0 0.10 0" width="0.30" height="0.18"
+                 material="color: #3a3f48; opacity: 0.98; side: double">
+          <a-text value="^" align="center" position="0 -0.01 0.01" width="0.8" color="#fff"></a-text>
+        </a-plane>
+
+        <a-plane class="clickable" ui-action="action: mvD"
+                 position="0 -0.10 0" width="0.30" height="0.18"
+                 material="color: #3a3f48; opacity: 0.98; side: double">
+          <a-text value="v" align="center" position="0 -0.01 0.01" width="0.8" color="#fff"></a-text>
+        </a-plane>
+
+        <a-plane class="clickable" ui-action="action: mvR"
+                 position="0.42 0 0" width="0.30" height="0.18"
+                 material="color: #3a3f48; opacity: 0.98; side: double">
+          <a-text value=">" align="center" position="0 -0.01 0.01" width="0.8" color="#fff"></a-text>
+        </a-plane>
+      </a-entity>
+
+      <!-- Zoom -->
+      <a-entity position="0 -0.22 0.01">
+        <a-plane class="clickable" ui-action="action: zoomOut"
+                 position="-0.33 0 0" width="0.46" height="0.18"
+                 material="color: #3a3f48; opacity: 0.98; side: double">
+          <a-text value="Zoom -" align="center" position="0 -0.01 0.01" width="1.1" color="#fff"></a-text>
+        </a-plane>
+        <a-plane class="clickable" ui-action="action: zoomIn"
+                 position="0.33 0 0" width="0.46" height="0.18"
+                 material="color: #3a3f48; opacity: 0.98; side: double">
+          <a-text value="Zoom +" align="center" position="0 -0.01 0.01" width="1.1" color="#fff"></a-text>
+        </a-plane>
+      </a-entity>
+
+      <!-- Reset + Switch -->
+      <a-entity position="0 -0.40 0.01">
+        <a-plane class="clickable" ui-action="action: reset"
+                 position="-0.33 0 0" width="0.46" height="0.18"
+                 material="color: #4a505a; opacity: 0.98; side: double">
+          <a-text value="Reset" align="center" position="0 -0.01 0.01" width="1.1" color="#fff"></a-text>
+        </a-plane>
+        <a-plane class="clickable" ui-action="action: switch"
+                 position="0.33 0 0" width="0.46" height="0.18"
+                 material="color: #4a505a; opacity: 0.98; side: double">
+          <a-text value="Switch" align="center" position="0 -0.01 0.01" width="1.1" color="#fff"></a-text>
+        </a-plane>
+      </a-entity>
+    </a-entity>
+</a-entity>
+    </a-entity>
+  </a-scene>
+</body>
+</html>

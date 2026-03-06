@@ -1,0 +1,119 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>SERVER - WebRTC stream</title>
+  <link href="noserv.css" rel="stylesheet">
+</head>
+<body>
+<h2>SERVER (captures camera) <span id="status">init</span></h2>
+
+<div class="videoGrid">
+  <div>
+    <h3>Local preview</h3>
+    <video id="localVideo" autoplay muted playsinline></video>
+  </div>
+</div>
+
+<h3>1) Offer SDP (copy to CLIENT)</h3>
+<textarea id="offerOut" readonly placeholder="Click Start → offer will appear here"></textarea>
+
+<h3>4) Answer SDP (paste from CLIENT) <button id="setAnswerBtn" disabled>Set answer</button></h3>
+<textarea id="answerIn" placeholder="Paste CLIENT answer SDP here"></textarea>
+
+<div class="controls">
+  <button id="startBtn">Start camera + create offer</button>
+  <button id="stopBtn" disabled>Stop</button>
+</div>
+
+<script>
+  const statusEl = document.getElementById("status");
+  const startBtn = document.getElementById("startBtn");
+  const stopBtn = document.getElementById("stopBtn");
+  const setAnswerBtn = document.getElementById("setAnswerBtn");
+
+  const localVideo = document.getElementById("localVideo");
+  const offerOut = document.getElementById("offerOut");
+  const answerIn = document.getElementById("answerIn");
+
+  let pc = null;
+  let localStream = null;
+
+  function setStatus(msg) { statusEl.textContent = msg; }
+
+  function makePeer() {
+    // STUN helps ICE work on real networks (still no TURN here)
+    return new RTCPeerConnection({
+      iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
+    });
+  }
+
+  async function start() {
+    startBtn.disabled = true;
+    setStatus("requesting camera…");
+
+    pc = makePeer();
+
+    pc.oniceconnectionstatechange = () => setStatus(pc.iceConnectionState);
+    pc.onicecandidate = (e) => {
+      if (e.candidate) return; // wait until gathering done
+      offerOut.value = JSON.stringify(pc.localDescription);
+      setStatus("offer ready (copy to client)");
+      setAnswerBtn.disabled = false;
+    };
+
+    localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+    localVideo.srcObject = localStream;
+
+    // Send video track(s) to the other peer
+    for (const track of localStream.getTracks()) {
+      pc.addTrack(track, localStream);
+    }
+
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+
+    stopBtn.disabled = false;
+  }
+
+  async function setAnswer() {
+    try {
+      const txt = answerIn.value.trim();
+      if (!txt) return alert("Paste the CLIENT answer SDP first.");
+      const answer = new RTCSessionDescription(JSON.parse(txt));
+      await pc.setRemoteDescription(answer);
+      setStatus("answer set, connecting…");
+      answerIn.disabled = true;
+      setAnswerBtn.disabled = true;
+    } catch (err) {
+      console.error(err);
+      alert("Invalid answer SDP: " + err.message);
+    }
+  }
+
+  function stop() {
+    setStatus("stopped");
+    offerOut.value = "";
+    answerIn.value = "";
+    answerIn.disabled = false;
+
+    setAnswerBtn.disabled = true;
+    stopBtn.disabled = true;
+    startBtn.disabled = false;
+
+    if (pc) pc.close();
+    pc = null;
+
+    if (localStream) {
+      localStream.getTracks().forEach(t => t.stop());
+      localStream = null;
+    }
+    localVideo.srcObject = null;
+  }
+
+  startBtn.addEventListener("click", start);
+  stopBtn.addEventListener("click", stop);
+  setAnswerBtn.addEventListener("click", setAnswer);
+</script>
+</body>
+</html>

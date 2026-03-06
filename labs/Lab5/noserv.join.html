@@ -1,0 +1,81 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>CLIENT - WebRTC stream</title>
+  <link href="noserv.css" rel="stylesheet">
+</head>
+<body>
+<h2>CLIENT (displays stream) <span id="status">init</span></h2>
+
+<div class="videoGrid">
+  <div>
+    <h3>Remote video</h3>
+    <video id="remoteVideo" autoplay playsinline></video>
+  </div>
+</div>
+
+<h3>2) Offer SDP (paste from SERVER)</h3>
+<textarea id="offerIn" placeholder="Paste SERVER offer SDP here"></textarea>
+
+<h3>3) Answer SDP (copy to SERVER) <button id="createAnswerBtn">Create answer</button></h3>
+<textarea id="answerOut" readonly></textarea>
+
+<script>
+  const statusEl = document.getElementById("status");
+  const offerIn = document.getElementById("offerIn");
+  const answerOut = document.getElementById("answerOut");
+  const createAnswerBtn = document.getElementById("createAnswerBtn");
+  const remoteVideo = document.getElementById("remoteVideo");
+
+  let pc = null;
+  let remoteStream = new MediaStream();
+
+  function setStatus(msg) { statusEl.textContent = msg; }
+
+  function makePeer() {
+    return new RTCPeerConnection({
+      iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
+    });
+  }
+
+  async function createAnswer() {
+    try {
+      const txt = offerIn.value.trim();
+      if (!txt) return alert("Paste the SERVER offer SDP first.");
+
+      pc = makePeer();
+
+      pc.oniceconnectionstatechange = () => setStatus(pc.iceConnectionState);
+
+      pc.ontrack = (e) => {
+        // Add tracks to a single stream for the <video>
+        remoteStream.addTrack(e.track);
+        remoteVideo.srcObject = remoteStream;
+      };
+
+      pc.onicecandidate = (e) => {
+        if (e.candidate) return;
+        answerOut.value = JSON.stringify(pc.localDescription);
+        setStatus("answer ready (copy to server)");
+        offerIn.disabled = true;
+        createAnswerBtn.disabled = true;
+      };
+
+      const offer = new RTCSessionDescription(JSON.parse(txt));
+      await pc.setRemoteDescription(offer);
+
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+
+      setStatus("creating answer…");
+    } catch (err) {
+      console.error(err);
+      alert("Invalid offer SDP: " + err.message);
+    }
+  }
+
+  createAnswerBtn.addEventListener("click", createAnswer);
+</script>
+</body>
+</html>

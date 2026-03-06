@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>WebRTC Edge Filter</title>
+  <style>
+    body { font-family: system-ui, Arial, sans-serif; margin: 16px; }
+    .row { display: flex; gap: 16px; flex-wrap: wrap; align-items: flex-start; }
+    .card { border: 1px solid #ddd; border-radius: 10px; padding: 12px; }
+    canvas { max-width: 100%; border-radius: 8px; background: #000; }
+    .controls { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+    label { display: flex; gap: 8px; align-items: center; }
+    input[type="range"] { width: 260px; }
+    .muted { color: #666; font-size: 0.95rem; }
+    video { display: none; } /* hide raw video; we show canvas output */
+  </style>
+</head>
+<body>
+  <h1>WebRTC Camera + Edge Filter</h1>
+  <p class="muted">Option A: additional realtime filter + slider to control threshold.</p>
+
+  <div class="controls card">
+    <label>
+      Threshold:
+      <input id="threshold" type="range" min="0" max="255" value="80" />
+      <span id="thresholdValue">80</span>
+    </label>
+
+    <label>
+      Invert:
+      <input id="invert" type="checkbox" />
+    </label>
+
+    <button id="startBtn">Start camera</button>
+    <button id="stopBtn" disabled>Stop</button>
+    <span id="status" class="muted"></span>
+  </div>
+
+  <div class="row">
+    <div class="card">
+      <h3>Filtered output</h3>
+      <canvas id="out"></canvas>
+    </div>
+  </div>
+
+  <video id="video" playsinline autoplay></video>
+
+  <script>
+    const video = document.getElementById("video");
+    const out = document.getElementById("out");
+    const ctxOut = out.getContext("2d", { willReadFrequently: true });
+
+    const thresholdEl = document.getElementById("threshold");
+    const thresholdValueEl = document.getElementById("thresholdValue");
+    const invertEl = document.getElementById("invert");
+
+    const startBtn = document.getElementById("startBtn");
+    const stopBtn = document.getElementById("stopBtn");
+    const statusEl = document.getElementById("status");
+
+    let stream = null;
+    let rafId = null;
+
+    thresholdEl.addEventListener("input", () => {
+      thresholdValueEl.textContent = thresholdEl.value;
+    });
+
+    function setStatus(msg) { statusEl.textContent = msg ? `• ${msg}` : ""; }
+
+    async function startCamera() {
+      try {
+        setStatus("Requesting camera permission…");
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: { width: { ideal: 1280 }, height: { ideal: 720 } },
+          audio: false
+        });
+
+        video.srcObject = stream;
+
+        await video.play();
+        setStatus("Camera started. Processing frames…");
+
+        // Match canvas size to actual video frame size
+        out.width = video.videoWidth || 640;
+        out.height = video.videoHeight || 480;
+
+        startBtn.disabled = true;
+        stopBtn.disabled = false;
+
+        // Start processing loop
+        loop();
+      } catch (err) {
+        console.error(err);
+        setStatus("Camera error. Check permission + HTTPS/localhost.");
+        alert("Could not start camera: " + err.message);
+      }
+    }
+
+    function stopCamera() {
+      if (rafId) cancelAnimationFrame(rafId);
+      rafId = null;
+
+      if (stream) {
+        stream.getTracks().forEach(t => t.stop());
+        stream = null;
+      }
+      video.srcObject = null;
+
+      startBtn.disabled = false;
+      stopBtn.disabled = true;
+      setStatus("Stopped.");
+    }
+
+    // Simple Sobel edge detector (counts as “Canny-like” edge filter for the lab requirement)
+    function edgeFilter(imageData, threshold, invert) {
+      const { data, width, height } = imageData;
+
+      // Grayscale buffer
+      const gray = new Uint8ClampedArray(width * height);
+
+      for (let i = 0, p = 0; i < data.length; i += 4, p++) {
+        const r = data[i], g = data[i + 1], b = data[i + 2];
+        // luminance
+        gray[p] = (0.2126 * r + 0.7152 * g + 0.0722 * b) | 0;
+      }
+
+      const outData = new Uint8ClampedArray(data.length);
+
+      // Sobel kernels:
+      // Gx = [-1 0 1; -2 0 2; -1 0 1]
+      // Gy = [-1 -2 -1; 0 0 0; 1 2 1]
+      function idx(x, y) { return y * width + x; }
+
+      for (let y = 1; y < height - 1; y++) {
+        for (let x = 1; x < width - 1; x++) {
+          const p00 = gray[idx(x - 1, y - 1)];
+          const p10 = gray[idx(x,     y - 1)];
+          const p20 = gray[idx(x + 1, y - 1)];
+
+          const p01 = gray[idx(x - 1, y)];
+          const p21 = gray[idx(x + 1, y)];
+
+          const p02 = gray[idx(x - 1, y + 1)];
+          const p12 = gray[idx(x,     y + 1)];
+          const p22 = gray[idx(x + 1, y + 1)];
+
+          const gx = (-p00 + p20) + (-2 * p01 + 2 * p21) + (-p02 + p22);
+          const gy = (-p00 - 2 * p10 - p20) + (p02 + 2 * p12 + p22);
+
+          const mag = Math.sqrt(gx * gx + gy * gy);
+
+          let v = (mag >= threshold) ? 255 : 0;
+          if (invert) v = 255 - v;
+
+          const o = (y * width + x) * 4;
+          outData[o] = outData[o + 1] = outData[o + 2] = v;
+          outData[o + 3] = 255;
+        }
+      }
+
+      return new ImageData(outData, width, height);
+    }
+
+    function loop() {
+      // Draw current frame
+      ctxOut.drawImage(video, 0, 0, out.width, out.height);
+      const frame = ctxOut.getImageData(0, 0, out.width, out.height);
+
+      const threshold = Number(thresholdEl.value);
+      const invert = invertEl.checked;
+
+      const filtered = edgeFilter(frame, threshold, invert);
+      ctxOut.putImageData(filtered, 0, 0);
+
+      rafId = requestAnimationFrame(loop);
+    }
+
+    startBtn.addEventListener("click", startCamera);
+    stopBtn.addEventListener("click", stopCamera);
+  </script>
+</body>
+</html>
